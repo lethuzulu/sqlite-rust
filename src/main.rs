@@ -19,16 +19,21 @@ fn read_varint(buffer: &[u8], start: usize) -> (u64, usize) {
 
 fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
-    if args.len() < 3 {
-        bail!("Usage: <database path> .tables");
+    if args.len() != 3 {
+        bail!("Usage: <database path> \"SELECT COUNT(*) FROM <table>\"");
     }
 
-    let command = &args[2];
-    if command != ".tables" {
-        bail!("Invalid command. Use .tables.");
-    }
+    let db_path = &args[1];
+    let query = &args[2];
 
-    let mut file = File::open(&args[1])?;
+    // Extract table name from query
+    let query_parts: Vec<&str> = query.split_whitespace().collect();
+    if query_parts.len() < 4 || query_parts[0].to_uppercase() != "SELECT" || query_parts[1] != "COUNT(*)" || query_parts[2].to_uppercase() != "FROM" {
+        bail!("Invalid query. Use: SELECT COUNT(*) FROM <table>");
+    }
+    let table_name = query_parts[3];
+
+    let mut file = File::open(db_path)?;
     let mut header = [0; 100];
     file.read_exact(&mut header)?;
 
@@ -46,32 +51,13 @@ fn main() -> Result<()> {
         bail!("No cells found on the page.");
     }
 
-    // Read cell pointer array
-    let mut cell_pointers = Vec::with_capacity(cell_count);
+    // Read cell pointer array and find table row in sqlite_schema
+    let mut table_root_page = None;
     for i in 0..cell_count {
-        let offset = 8 + i * 2; // Start of cell pointer array
-        if offset + 1 >= page_size {
-            bail!("Invalid cell pointer offset at index {}", i);
-        }
+        let offset = 8 + i * 2;
         let pointer = u16::from_be_bytes([page[offset], page[offset + 1]]) as usize;
-        eprintln!("Cell pointer {}: {}", i, pointer); // Debug
-
-        if pointer >= page_size {
-            bail!("Cell pointer out of bounds at index {}", i);
-        }
-        cell_pointers.push(pointer);
-    }
-
-    let mut table_names = Vec::new();
-
-    for (i, &pointer) in cell_pointers.iter().enumerate() {
-        let cell_start = pointer;
-        if cell_start >= page_size {
-            bail!("Cell start out of bounds for cell index {}", i);
-        }
-
-        let (payload_size, payload_size_len) = read_varint(&page, cell_start);
-        let pos = cell_start + payload_size_len;
+        let (payload_size, payload_size_len) = read_varint(&page, pointer);
+        let pos = pointer + payload_size_len;
 
         // Skip rowid
         let (_, rowid_size) = read_varint(&page, pos);
@@ -82,10 +68,6 @@ fn main() -> Result<()> {
         pos += header_size_len;
 
         let header_end = pos + header_size as usize;
-        if header_end > page_size {
-            bail!("Header end out of bounds for cell index {}", i);
-        }
-
         let mut serial_types = Vec::new();
         while pos < header_end {
             let (serial_type, size) = read_varint(&page, pos);
@@ -95,24 +77,53 @@ fn main() -> Result<()> {
 
         pos = header_end;
 
-        // Extract tbl_name (second column)
-        if let Some(&second_type) = serial_types.get(1) {
-            if second_type >= 13 && second_type % 2 == 1 {
-                let str_len = ((second_type - 13) / 2) as usize;
-                if pos + str_len > page_size {
-                    bail!("String length out of bounds for cell index {}", i);
-                }
-                let table_name = String::from_utf8_lossy(&page[pos..pos + str_len]).to_string();
-                if !table_name.starts_with("sqlite_") {
-                    table_names.push(table_name);
+        // Skip to tbl_name column (2nd column)
+        let mut column_idx = 0;
+        let mut current_pos = pos;
+        for &serial_type in &serial_types {
+            if column_idx == 1 {
+                if serial_type >= 13 && serial_type % 2 == 1 {
+                    let str_len = ((serial_type - 13) / 2) as usize;
+                    let name = String::from_utf8_lossy(&page[current_pos..current_pos + str_len]);
+                    if name == table_name {
+                        // Rootpage is in the 4th column (index 3)
+                        if let Some(&rootpage_type) = serial_types.get(3) {
+                            if rootpage_type == 6 {
+                                let rootpage = u32::from_be_bytes([
+                                    page[current_pos],
+                                    page[current_pos + 1],
+                                    page[current_pos + 2],
+                                    page[current_pos + 3],
+                                ]);
+                                table_root_page = Some(rootpage);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
+            if serial_type >= 13 && serial_type % 2 == 1 {
+                current_pos += ((serial_type - 13) / 2) as usize;
+            } else if serial_type == 6 {
+                current_pos += 4;
+            }
+            column_idx += 1;
+        }
+
+        if table_root_page.is_some() {
+            break;
         }
     }
 
-    // Sort and print table names
-    table_names.sort_unstable();
-    println!("{}", table_names.join(" "));
+    let rootpage = table_root_page.ok_or_else(|| anyhow::anyhow!("Table '{}' not found in sqlite_schema", table_name))?;
+    eprintln!("Root page for table '{}': {}", table_name, rootpage);
+
+    // Read root page to count rows
+    file.seek(SeekFrom::Start((rootpage as usize - 1) * page_size as u64))?;
+    file.read_exact(&mut page)?;
+
+    let row_count = u16::from_be_bytes([page[3], page[4]]) as usize;
+    println!("{}", row_count);
 
     Ok(())
 }
