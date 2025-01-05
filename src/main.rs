@@ -16,21 +16,26 @@ fn main() -> Result<()> {
     match command.as_str() {
         ".dbinfo" => {
             let mut file = File::open(&args[1])?;
+            
+            // Read file header (100 bytes should be enough for our needs)
             let mut header = [0; 100];
             file.read_exact(&mut header)?;
 
-            // The page size is stored at the 16th byte offset, using 2 bytes in big-endian order
-            #[allow(unused_variables)]
+            // Get page size from header (bytes 16-17, big-endian)
             let page_size = u16::from_be_bytes([header[16], header[17]]);
+            
+            // The number of cells (tables) is stored in the page header of the sqlite_schema page
+            // The page header starts after the file header (100 bytes)
+            // The number of cells is a 2-byte big-endian value at offset 3 in the page header
+            let mut cell_count_bytes = [0; 2];
+            file.seek(std::io::SeekFrom::Start(103))?; // 100 bytes + 3 bytes offset
+            file.read_exact(&mut cell_count_bytes)?;
+            let number_of_tables = u16::from_be_bytes(cell_count_bytes);
 
-            // You can use print statements as follows for debugging, they'll be visible when running tests.
-            eprintln!("Logs from your program will appear here!");
-
-            // Uncomment this block to pass the first stage
             println!("database page size: {}", page_size);
+            println!("number of tables: {}", number_of_tables);
         }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
-
     Ok(())
 }
